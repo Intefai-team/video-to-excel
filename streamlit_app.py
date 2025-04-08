@@ -1,19 +1,10 @@
-import subprocess
-import threading
 import streamlit as st
 import requests
 import time
-from io import BytesIO
+import os
 
-# Start Flask backend in a separate thread
-def run_flask():
-    subprocess.Popen(["python", "app.py"])
-
-flask_thread = threading.Thread(target=run_flask, daemon=True)
-flask_thread.start()
-
-# Wait for Flask to initialize
-time.sleep(3)
+# Configuration
+FLASK_URL = os.getenv("FLASK_URL", "https://video-to-excel.onrender.com")
 
 # Set page config
 st.set_page_config(
@@ -78,6 +69,18 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# Backend status
+with st.expander("Backend Status", expanded=False):
+    try:
+        health_response = requests.get(f"{FLASK_URL}/health", timeout=2)
+        if health_response.status_code == 200:
+            st.success(f"✅ Backend service is available at {FLASK_URL}")
+            st.json(health_response.json())
+        else:
+            st.error(f"❌ Backend service unavailable at {FLASK_URL}")
+    except:
+        st.error(f"❌ Could not connect to backend at {FLASK_URL}")
+
 # File uploader
 uploaded_file = st.file_uploader(
     "Choose a video file (MP4, MOV, AVI)",
@@ -95,14 +98,13 @@ if uploaded_file is not None:
     if st.button("🚀 Upload & Transcribe", key="transcribe"):
         with st.spinner("🔍 Processing video... This may take a few minutes..."):
             try:
-                # Send to Flask backend
                 files = {"video": uploaded_file}
                 start_time = time.time()
                 
                 response = requests.post(
-                    "http://localhost:5000/transcribe",
+                    f"{FLASK_URL}/transcribe",
                     files=files,
-                    timeout=300  # 5 minute timeout
+                    timeout=300
                 )
                 
                 if response.status_code != 200:
@@ -132,7 +134,7 @@ if uploaded_file is not None:
                         with st.spinner("Generating Excel file..."):
                             try:
                                 excel_response = requests.post(
-                                    "http://localhost:5000/download_excel",
+                                    f"{FLASK_URL}/download_excel",
                                     json=result,
                                     headers={"Content-Type": "application/json"},
                                     timeout=60
@@ -168,11 +170,3 @@ st.markdown("""
 - For best results, use videos with clear audio
 - Maximum recommended video length: 5 minutes
 """)
-
-# Health check for Flask backend
-try:
-    health_response = requests.get("http://localhost:5000/health", timeout=2)
-    if health_response.status_code != 200:
-        st.warning("Flask backend is not responding properly")
-except:
-    st.error("Flask backend failed to start")
