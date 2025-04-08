@@ -21,18 +21,23 @@ CORS(app)
 # Disable unnecessary logging
 logging.getLogger("moviepy").setLevel(logging.WARNING)
 
+# Memory optimization
+TORCH_THREADS = 1  # Limit CPU threads
+MAX_VIDEO_DURATION = 120  # 2 minutes max
+WHISPER_MODEL = "tiny"  # Smallest viable model
+
 def load_whisper_model():
     try:
-        # Force CPU to save memory (comment out if you have GPU)
-        device = "cpu"  # Changed from cuda to cpu
-        logger.info(f"Loading Whisper model on {device}")
+        device = "cpu"  # Force CPU to save memory
+        torch.set_num_threads(TORCH_THREADS)
+        logger.info(f"Loading Whisper {WHISPER_MODEL} model on {device} with {TORCH_THREADS} threads")
         
-        # Load smaller model but keep functionality
-        model = whisper.load_model("small", device=device)  # Changed from base to small
+        model = whisper.load_model(WHISPER_MODEL, device=device)
         
-        # Memory optimization
-        if device == "cpu":
-            torch.set_num_threads(1)  # Limit CPU threads
+        # Initial memory cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
             
         logger.info("Model loaded successfully")
         return model
@@ -50,7 +55,7 @@ def check_ffmpeg():
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-def extract_audio(video_path, max_duration=180):  # Reduced from 300 to 180 seconds
+def extract_audio(video_path):
     audio_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
@@ -60,16 +65,15 @@ def extract_audio(video_path, max_duration=180):  # Reduced from 300 to 180 seco
             if clip.audio is None:
                 return None, "No audio stream found"
                 
-            if clip.duration > max_duration:
-                return None, f"Video exceeds {max_duration} second limit"
+            if clip.duration > MAX_VIDEO_DURATION:
+                return None, f"Video exceeds {MAX_VIDEO_DURATION} second limit"
                 
-            # Optimized audio extraction
             clip.audio.write_audiofile(
                 audio_path, 
                 codec="pcm_s16le", 
                 fps=16000,
                 logger=None,
-                ffmpeg_params=["-ac", "1"]  # Mono audio to save memory
+                ffmpeg_params=["-ac", "1"]  # Mono audio
             )
         
         return audio_path, None
@@ -86,21 +90,18 @@ def transcribe_audio(audio_path):
         if whisper_model is None:
             return None, "Whisper model not loaded"
             
-        # Optimized transcription
         result = whisper_model.transcribe(
             audio_path,
             language="en",
             fp16=False,
-            task="transcribe"  # Explicitly set to transcribe
+            task="transcribe"
         )
         return result["text"], None
     except Exception as e:
         return None, f"Transcription error: {str(e)}"
 
 def extract_info(text):
-    data = {"name": None, "location": None}
-    
-    # Pre-compile regex patterns for better performance
+    # Pre-compiled patterns for better performance
     name_patterns = [
         re.compile(r"(?:hi|hello|hey)[, ]*(?:this is me|i am|my name is|myself) ([A-Z][a-z]+)", re.IGNORECASE),
         re.compile(r"\bthis is me[, ]*([A-Z][a-z]+)\b", re.IGNORECASE),
@@ -115,14 +116,13 @@ def extract_info(text):
         re.compile(r"\bmoved to ([A-Z][a-z]+)\b", re.IGNORECASE)
     ]
     
+    data = {"name": None, "location": None}
+    
     for pattern in name_patterns:
         match = pattern.search(text)
         if match:
             name = match.group(1).strip()
-            if name.lower() in ["pyle", "pail", "pyl"]:
-                data["name"] = "Payal"
-            else:
-                data["name"] = name
+            data["name"] = "Payal" if name.lower() in ["pyle", "pail", "pyl"] else name
             break
     
     for pattern in location_patterns:
@@ -138,7 +138,8 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "whisper_loaded": whisper_model is not None,
-        "ffmpeg_available": check_ffmpeg()
+        "ffmpeg_available": check_ffmpeg(),
+        "max_duration": MAX_VIDEO_DURATION
     })
 
 @app.route("/transcribe", methods=["POST"])
@@ -154,22 +155,18 @@ def transcribe():
     audio_path = None
     
     try:
-        # Save video
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
             video_path = f.name
             file.save(f.name)
             
-        # Process audio
         audio_path, audio_error = extract_audio(video_path)
         if audio_error:
             raise Exception(audio_error)
             
-        # Transcribe
         transcription, transcribe_error = transcribe_audio(audio_path)
         if transcribe_error:
             raise Exception(transcribe_error)
             
-        # Extract info
         extracted = extract_info(transcription)
         
         return jsonify({
@@ -181,7 +178,6 @@ def transcribe():
         logger.error(f"Processing error: {str(e)}")
         return jsonify({"error": str(e)}), 500
     finally:
-        # Enhanced cleanup with memory management
         for path in [video_path, audio_path]:
             if path and os.path.exists(path):
                 try:
@@ -189,8 +185,6 @@ def transcribe():
                 except Exception as e:
                     logger.warning(f"Could not remove {path}: {str(e)}")
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 @app.route("/download_excel", methods=["POST"])
 def download_excel():
@@ -200,7 +194,6 @@ def download_excel():
         if not data:
             return jsonify({"error": "No data provided"}), 400
             
-        # Optimized DataFrame creation
         df = pd.DataFrame([{
             "Name": data.get("extracted_info", {}).get("name", "N/A"),
             "Location": data.get("extracted_info", {}).get("location", "N/A"),
@@ -209,7 +202,7 @@ def download_excel():
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
             excel_path = f.name
-            df.to_excel(excel_path, index=False, engine='openpyxl')  # Specify engine
+            df.to_excel(excel_path, index=False, engine='openpyxl')
             
         return send_file(
             excel_path,
@@ -229,6 +222,6 @@ def download_excel():
         gc.collect()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))  # Render's default port
     logger.info(f"Starting server on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
