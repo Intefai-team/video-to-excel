@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # More specific CORS configuration
+CORS(app)
 
 # Disable unnecessary logging
 logging.getLogger("moviepy").setLevel(logging.WARNING)
@@ -36,17 +36,12 @@ def load_whisper_model():
         torch.set_num_threads(TORCH_THREADS)
         logger.info(f"Loading {WHISPER_MODEL_SIZE} model on {device} (threads: {TORCH_THREADS})")
         
-        # Load model with progress callback
-        def progress_callback(current, total):
-            logger.debug(f"Model loading: {current/total:.1%}")
-            
         model = whisper.load_model(
             WHISPER_MODEL_SIZE, 
             device=device,
             download_root=os.path.join(tempfile.gettempdir(), "whisper")
         )
         
-        # Memory optimization
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -91,7 +86,7 @@ def extract_audio(video_path):
                 codec="pcm_s16le", 
                 fps=16000,
                 logger=None,
-                ffmpeg_params=["-ac", "1", "-threads", "1"]  # Mono + single thread
+                ffmpeg_params=["-ac", "1", "-threads", "1"]
             )
         
         return audio_path, None
@@ -120,7 +115,7 @@ def transcribe_audio(audio_path):
             language="en",
             fp16=False,
             task="transcribe",
-            verbose=None  # Disable progress prints
+            verbose=None
         )
         return result["text"], None
     except Exception as e:
@@ -132,37 +127,48 @@ def extract_info(text):
     if not text or not isinstance(text, str):
         return {"name": None, "location": None}
     
-    # Pre-compiled patterns (compile once at module load)
     name_patterns = [
-        re.compile(r"(?:hi|hello|hey)[, ]*(?:this is me|i am|my name is|myself) ([A-Z][a-z]+(?: [A-Z][a-z]+)*", re.IGNORECASE),
-        re.compile(r"\b(?:this is me|my name is|i am)[, ]*([A-Z][a-z]+(?: [A-Z][a-z]+)*\b", re.IGNORECASE)
+        re.compile(r"(?:hi|hello|hey)[, ]*(?:this is me|i am|my name is|myself) ([A-Z][a-z]+)", re.IGNORECASE),
+        re.compile(r"\bthis is me[, ]*([A-Z][a-z]+)\b", re.IGNORECASE),
+        re.compile(r"\bmy name is ([A-Z][a-z]+)\b", re.IGNORECASE),
+        re.compile(r"\bi am ([A-Z][a-z]+)\b", re.IGNORECASE)
     ]
     
     location_patterns = [
-        re.compile(r"\b(?:i'm from|i live in|i am from|located in|based in) ([A-Z][a-z]+(?: [A-Z][a-z]+)*\b", re.IGNORECASE),
-        re.compile(r"\b(?:in|from) ([A-Z][a-z]+(?: [A-Z][a-z]+)*\b(?!\w)", re.IGNORECASE)
+        re.compile(r"\b(?:i'm from|i live in|i am from) ([A-Z][a-z]+)\b", re.IGNORECASE),
+        re.compile(r"\b(?:in|from) ([A-Z][a-z]+)(?:,|\s|$)", re.IGNORECASE),
+        re.compile(r"\bdid \w+ in ([A-Z][a-z]+)\b", re.IGNORECASE),
+        re.compile(r"\bmoved to ([A-Z][a-z]+)\b", re.IGNORECASE)
     ]
     
     data = {"name": None, "location": None}
     
-    # Name extraction with multiple patterns
     for pattern in name_patterns:
-        if data["name"]:
-            break
         match = pattern.search(text)
         if match:
             name = match.group(1).strip()
             data["name"] = "Payal" if name.lower() in ["pyle", "pail", "pyl"] else name
-    
-    # Location extraction with multiple patterns
-    for pattern in location_patterns:
-        if data["location"]:
             break
+    
+    for pattern in location_patterns:
         match = pattern.search(text)
         if match:
             data["location"] = match.group(1).strip()
+            break
     
     return data
+
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "running",
+        "service": "Video Transcription API",
+        "endpoints": {
+            "health_check": "/health (GET)",
+            "transcribe": "/transcribe (POST)",
+            "download_excel": "/download_excel (POST)"
+        }
+    })
 
 @app.route("/health", methods=["GET"])
 def health_check():
@@ -180,19 +186,17 @@ def transcribe():
         return jsonify({"error": "No video file provided"}), 400
         
     file = request.files["video"]
-    if not file.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
-        return jsonify({"error": "Invalid file type. Supported: .mp4, .mov, .avi, .mkv, .webm"}), 400
+    if not file.filename.lower().endswith(('.mp4', '.mov', '.avi')):
+        return jsonify({"error": "Invalid file type"}), 400
     
     video_path = None
     audio_path = None
     
     try:
-        # Save video with checks
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
             video_path = f.name
             file.save(f.name)
             
-            # Verify file was actually saved
             if os.path.getsize(video_path) == 0:
                 raise Exception("Uploaded file is empty")
             
@@ -219,7 +223,6 @@ def transcribe():
             "success": False
         }), 500
     finally:
-        # Enhanced cleanup with error handling
         for path in [video_path, audio_path]:
             if path and os.path.exists(path):
                 try:
@@ -238,10 +241,6 @@ def download_excel():
         data = request.get_json()
         if not data:
             return jsonify({"error": "No data provided"}), 400
-            
-        # Validate input structure
-        if not isinstance(data.get("extracted_info", {}), dict):
-            return jsonify({"error": "Invalid data format"}), 400
             
         df = pd.DataFrame([{
             "Name": data.get("extracted_info", {}).get("name", "N/A"),
@@ -276,12 +275,8 @@ def download_excel():
                 logger.warning(f"Excel cleanup failed: {str(e)}")
         gc.collect()
 
-# ... [keep all your imports and initial configuration the same] ...
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    
-    # Add this line to ensure proper port binding detection
     os.environ['FLASK_RUN_PORT'] = str(port)
     
     logger.info(f"Starting server on port {port}")
