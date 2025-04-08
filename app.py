@@ -276,8 +276,14 @@ def download_excel():
                 logger.warning(f"Excel cleanup failed: {str(e)}")
         gc.collect()
 
+# ... [keep all your imports and initial configuration the same] ...
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    
+    # Add this line to ensure proper port binding detection
+    os.environ['FLASK_RUN_PORT'] = str(port)
+    
     logger.info(f"Starting server on port {port}")
     app.run(
         host="0.0.0.0",
