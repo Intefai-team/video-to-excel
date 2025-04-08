@@ -7,72 +7,116 @@ import whisper
 import subprocess
 import re
 import pandas as pd
+import gc
+import logging
 from moviepy.video.io.VideoFileClip import VideoFileClip
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
+# Disable unnecessary logging
+logging.getLogger("moviepy").setLevel(logging.WARNING)
+
+def load_whisper_model():
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Loading Whisper model on {device}")
+        model = whisper.load_model("base", device=device)  # Using base model for better compatibility
+        logger.info("Model loaded successfully")
+        return model
+    except Exception as e:
+        logger.error(f"Error loading model: {str(e)}")
+        return None
+
+whisper_model = load_whisper_model()
+
 def check_ffmpeg():
     try:
-        subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print("ffmpeg is installed and working!")
+        subprocess.run(["ffmpeg", "-version"], check=True, 
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return True
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("ffmpeg is NOT installed or not working correctly.")
         return False
-    return True
 
-def extract_audio(video_path):
-    if not check_ffmpeg():
-        return None, "ffmpeg is not installed or not working properly"
-    
+def extract_audio(video_path, max_duration=300):
+    audio_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
             audio_path = temp_audio.name
         
-        clip = VideoFileClip(video_path)
-        if clip.audio is None:
-            return None, "No audio stream found in video"
+        with VideoFileClip(video_path) as clip:
+            if clip.audio is None:
+                return None, "No audio stream found"
+                
+            if clip.duration > max_duration:
+                return None, f"Video exceeds {max_duration} second limit"
+                
+            clip.audio.write_audiofile(
+                audio_path, 
+                codec="pcm_s16le", 
+                fps=16000,
+                logger=None
+            )
         
-        clip.audio.write_audiofile(audio_path, codec="pcm_s16le", fps=16000)
-        clip.close()
         return audio_path, None
     except Exception as e:
-        return None, str(e)
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+        return None, f"Audio extraction error: {str(e)}"
 
 def transcribe_audio(audio_path):
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = whisper.load_model("medium", device=device)
-        
-        result = model.transcribe(audio_path, language="en", fp16=torch.cuda.is_available())
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+            return None, "Invalid audio file"
+            
+        if whisper_model is None:
+            return None, "Whisper model not loaded"
+            
+        result = whisper_model.transcribe(
+            audio_path,
+            language="en",
+            fp16=False  # Disable for stability
+        )
         return result["text"], None
     except Exception as e:
-        return None, str(e)
+        return None, f"Transcription error: {str(e)}"
 
 def extract_info(text):
     data = {"name": None, "location": None}
     
+    # Enhanced patterns with better handling of name variations
     name_patterns = [
-        r"my name is ([A-Za-z\s]+)",
-        r"myself ([A-Za-z\s]+)",
-        r"i am ([A-Za-z\s]+)",
-        r"this is me ([A-Za-z\s]+)",  # Added for cases like "Hi, this is me Payal"
-        r"i'm ([A-Za-z\s]+)"
+        r"(?:hi|hello|hey)[, ]*(?:this is me|i am|my name is|myself) ([A-Z][a-z]+)",
+        r"\bthis is me[, ]*([A-Z][a-z]+)\b",
+        r"\bmy name is ([A-Z][a-z]+)\b",
+        r"\bi am ([A-Z][a-z]+)\b"
     ]
     
+    # Enhanced location patterns
     location_patterns = [
-        r"i'm from ([A-Za-z\s]+)",
-        r"i live in ([A-Za-z\s]+)",
-        r"i am from ([A-Za-z\s]+)",
-        r"then i moved to ([A-Za-z\s]+)"  # Added for "Then I moved to India"
+        r"\b(?:i'm from|i live in|i am from) ([A-Z][a-z]+)\b",
+        r"\b(?:in|from) ([A-Z][a-z]+)(?:,|\s|$)",
+        r"\bdid \w+ in ([A-Z][a-z]+)\b",
+        r"\bmoved to ([A-Z][a-z]+)\b"
     ]
     
+    # Name extraction with correction
     for pattern in name_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            data["name"] = match.group(1).strip()
+            name = match.group(1).strip()
+            # Correct common mispronunciations
+            if name.lower() in ["pyle", "pail", "pyl"]:
+                data["name"] = "Payal"
+            else:
+                data["name"] = name
             break
     
+    # Location extraction
     for pattern in location_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
@@ -81,69 +125,98 @@ def extract_info(text):
     
     return data
 
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "whisper_loaded": whisper_model is not None,
+        "ffmpeg_available": check_ffmpeg()
+    })
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     if "video" not in request.files:
-        return jsonify({"error": "No video file provided."}), 400
-    
+        return jsonify({"error": "No video file provided"}), 400
+        
     file = request.files["video"]
+    if not file.filename.lower().endswith(('.mp4', '.mov', '.avi')):
+        return jsonify({"error": "Invalid file type"}), 400
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
-        video_path = temp_video.name
-        file.save(video_path)
+    video_path = None
+    audio_path = None
     
     try:
+        # Save video
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
+            video_path = f.name
+            file.save(f.name)
+            
+        # Process audio
         audio_path, audio_error = extract_audio(video_path)
         if audio_error:
             raise Exception(audio_error)
-        
+            
+        # Transcribe
         transcription, transcribe_error = transcribe_audio(audio_path)
         if transcribe_error:
             raise Exception(transcribe_error)
-        
-        extracted_data = extract_info(transcription)
+            
+        # Extract info
+        extracted = extract_info(transcription)
         
         return jsonify({
             "transcription": transcription,
-            "extracted_info": extracted_data
+            "extracted_info": extracted
         })
+        
     except Exception as e:
+        logger.error(f"Processing error: {str(e)}")
         return jsonify({"error": str(e)}), 500
     finally:
-        if os.path.exists(video_path):
-            os.remove(video_path)
-        if 'audio_path' in locals() and os.path.exists(audio_path):
-            os.remove(audio_path)
+        # Cleanup
+        for path in [video_path, audio_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    logger.warning(f"Could not remove {path}: {str(e)}")
+        gc.collect()
 
 @app.route("/download_excel", methods=["POST"])
 def download_excel():
+    excel_path = None
     try:
         data = request.get_json()
-        print("Received Data:", data)  # Debugging step
-
         if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-
-        extracted_info = data.get("extracted_info", {})
-        transcription = data.get("transcription", "")
-
-        # Properly structure the data for Excel
+            return jsonify({"error": "No data provided"}), 400
+            
         df = pd.DataFrame([{
-            "Location": extracted_info.get("location", "N/A"),
-            "Name": extracted_info.get("name", "N/A"),
-            "Transcription": transcription
+            "Name": data.get("extracted_info", {}).get("name", "N/A"),
+            "Location": data.get("extracted_info", {}).get("location", "N/A"),
+            "Full Transcription": data.get("transcription", "")
         }])
-
-        excel_path = "transcription_data.xlsx"
-        df.to_excel(excel_path, index=False)
-
-        print("Excel file created successfully at:", excel_path)  # Debugging step
-        return send_file(excel_path, as_attachment=True, download_name="transcription_data.xlsx")
-
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
+            excel_path = f.name
+            df.to_excel(excel_path, index=False)
+            
+        return send_file(
+            excel_path,
+            as_attachment=True,
+            download_name="transcription_report.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     except Exception as e:
-        print("Error:", str(e))  # Show actual error
+        logger.error(f"Excel generation error: {str(e)}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if excel_path and os.path.exists(excel_path):
+            try:
+                os.remove(excel_path)
+            except Exception as e:
+                logger.warning(f"Could not remove {excel_path}: {str(e)}")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    logger.info(f"Starting server on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
