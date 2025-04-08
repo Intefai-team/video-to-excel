@@ -6,3 +6,5 @@ moviepy==1.0.3
 pandas==2.0.3
 numpy==1.24.3
 python-dotenv==1.0.0
+openpyxl==3.1.2  # Required for Excel export
+ffmpeg-python==0.2.0
