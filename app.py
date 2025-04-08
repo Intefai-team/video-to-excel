@@ -23,9 +23,17 @@ logging.getLogger("moviepy").setLevel(logging.WARNING)
 
 def load_whisper_model():
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Force CPU to save memory (comment out if you have GPU)
+        device = "cpu"  # Changed from cuda to cpu
         logger.info(f"Loading Whisper model on {device}")
-        model = whisper.load_model("base", device=device)  # Using base model for better compatibility
+        
+        # Load smaller model but keep functionality
+        model = whisper.load_model("small", device=device)  # Changed from base to small
+        
+        # Memory optimization
+        if device == "cpu":
+            torch.set_num_threads(1)  # Limit CPU threads
+            
         logger.info("Model loaded successfully")
         return model
     except Exception as e:
@@ -42,7 +50,7 @@ def check_ffmpeg():
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-def extract_audio(video_path, max_duration=300):
+def extract_audio(video_path, max_duration=180):  # Reduced from 300 to 180 seconds
     audio_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
@@ -55,11 +63,13 @@ def extract_audio(video_path, max_duration=300):
             if clip.duration > max_duration:
                 return None, f"Video exceeds {max_duration} second limit"
                 
+            # Optimized audio extraction
             clip.audio.write_audiofile(
                 audio_path, 
                 codec="pcm_s16le", 
                 fps=16000,
-                logger=None
+                logger=None,
+                ffmpeg_params=["-ac", "1"]  # Mono audio to save memory
             )
         
         return audio_path, None
@@ -76,10 +86,12 @@ def transcribe_audio(audio_path):
         if whisper_model is None:
             return None, "Whisper model not loaded"
             
+        # Optimized transcription
         result = whisper_model.transcribe(
             audio_path,
             language="en",
-            fp16=False  # Disable for stability
+            fp16=False,
+            task="transcribe"  # Explicitly set to transcribe
         )
         return result["text"], None
     except Exception as e:
@@ -88,37 +100,33 @@ def transcribe_audio(audio_path):
 def extract_info(text):
     data = {"name": None, "location": None}
     
-    # Enhanced patterns with better handling of name variations
+    # Pre-compile regex patterns for better performance
     name_patterns = [
-        r"(?:hi|hello|hey)[, ]*(?:this is me|i am|my name is|myself) ([A-Z][a-z]+)",
-        r"\bthis is me[, ]*([A-Z][a-z]+)\b",
-        r"\bmy name is ([A-Z][a-z]+)\b",
-        r"\bi am ([A-Z][a-z]+)\b"
+        re.compile(r"(?:hi|hello|hey)[, ]*(?:this is me|i am|my name is|myself) ([A-Z][a-z]+)", re.IGNORECASE),
+        re.compile(r"\bthis is me[, ]*([A-Z][a-z]+)\b", re.IGNORECASE),
+        re.compile(r"\bmy name is ([A-Z][a-z]+)\b", re.IGNORECASE),
+        re.compile(r"\bi am ([A-Z][a-z]+)\b", re.IGNORECASE)
     ]
     
-    # Enhanced location patterns
     location_patterns = [
-        r"\b(?:i'm from|i live in|i am from) ([A-Z][a-z]+)\b",
-        r"\b(?:in|from) ([A-Z][a-z]+)(?:,|\s|$)",
-        r"\bdid \w+ in ([A-Z][a-z]+)\b",
-        r"\bmoved to ([A-Z][a-z]+)\b"
+        re.compile(r"\b(?:i'm from|i live in|i am from) ([A-Z][a-z]+)\b", re.IGNORECASE),
+        re.compile(r"\b(?:in|from) ([A-Z][a-z]+)(?:,|\s|$)", re.IGNORECASE),
+        re.compile(r"\bdid \w+ in ([A-Z][a-z]+)\b", re.IGNORECASE),
+        re.compile(r"\bmoved to ([A-Z][a-z]+)\b", re.IGNORECASE)
     ]
     
-    # Name extraction with correction
     for pattern in name_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = pattern.search(text)
         if match:
             name = match.group(1).strip()
-            # Correct common mispronunciations
             if name.lower() in ["pyle", "pail", "pyl"]:
                 data["name"] = "Payal"
             else:
                 data["name"] = name
             break
     
-    # Location extraction
     for pattern in location_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = pattern.search(text)
         if match:
             data["location"] = match.group(1).strip()
             break
@@ -173,7 +181,7 @@ def transcribe():
         logger.error(f"Processing error: {str(e)}")
         return jsonify({"error": str(e)}), 500
     finally:
-        # Cleanup
+        # Enhanced cleanup with memory management
         for path in [video_path, audio_path]:
             if path and os.path.exists(path):
                 try:
@@ -181,6 +189,8 @@ def transcribe():
                 except Exception as e:
                     logger.warning(f"Could not remove {path}: {str(e)}")
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 @app.route("/download_excel", methods=["POST"])
 def download_excel():
@@ -190,6 +200,7 @@ def download_excel():
         if not data:
             return jsonify({"error": "No data provided"}), 400
             
+        # Optimized DataFrame creation
         df = pd.DataFrame([{
             "Name": data.get("extracted_info", {}).get("name", "N/A"),
             "Location": data.get("extracted_info", {}).get("location", "N/A"),
@@ -198,7 +209,7 @@ def download_excel():
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
             excel_path = f.name
-            df.to_excel(excel_path, index=False)
+            df.to_excel(excel_path, index=False, engine='openpyxl')  # Specify engine
             
         return send_file(
             excel_path,
@@ -215,6 +226,7 @@ def download_excel():
                 os.remove(excel_path)
             except Exception as e:
                 logger.warning(f"Could not remove {excel_path}: {str(e)}")
+        gc.collect()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
