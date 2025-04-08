@@ -1,6 +1,19 @@
+import subprocess
+import threading
 import streamlit as st
 import requests
 import time
+from io import BytesIO
+
+# Start Flask backend in a separate thread
+def run_flask():
+    subprocess.Popen(["python", "app.py"])
+
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+
+# Wait for Flask to initialize
+time.sleep(3)
 
 # Set page config
 st.set_page_config(
@@ -109,7 +122,7 @@ if uploaded_file is not None:
                     with st.expander("📝 Full Transcription", expanded=False):
                         st.write(result.get("transcription", ""))
                     
-                    # Prepare download button
+                    # Download button
                     st.markdown("---")
                     st.markdown("### Download Results")
                     
@@ -155,3 +168,11 @@ st.markdown("""
 - For best results, use videos with clear audio
 - Maximum recommended video length: 5 minutes
 """)
+
+# Health check for Flask backend
+try:
+    health_response = requests.get("http://localhost:5000/health", timeout=2)
+    if health_response.status_code != 200:
+        st.warning("Flask backend is not responding properly")
+except:
+    st.error("Flask backend failed to start")
