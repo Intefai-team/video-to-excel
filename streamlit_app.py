@@ -3,8 +3,8 @@ import requests
 import time
 import os
 
-# Configuration
-FLASK_URL = os.getenv("FLASK_URL", "https://video-to-excel.onrender.com")
+# Configuration - Updated to your Render URL
+FLASK_URL = os.getenv("FLASK_URL", "https://video-ypj7.onrender.com")
 
 # Set page config
 st.set_page_config(
@@ -69,17 +69,18 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Backend status
+# Backend status check - Modified to check root endpoint since you don't have /health
 with st.expander("Backend Status", expanded=False):
     try:
-        health_response = requests.get(f"{FLASK_URL}/health", timeout=2)
-        if health_response.status_code == 200:
+        # Try accessing the root endpoint or any valid endpoint
+        test_response = requests.get(FLASK_URL, timeout=2)
+        if test_response.status_code in [200, 404, 405]:  # 405 is Method Not Allowed (which means endpoint exists)
             st.success(f"✅ Backend service is available at {FLASK_URL}")
-            st.json(health_response.json())
         else:
-            st.error(f"❌ Backend service unavailable at {FLASK_URL}")
-    except:
+            st.error(f"❌ Backend service returned status {test_response.status_code}")
+    except Exception as e:
         st.error(f"❌ Could not connect to backend at {FLASK_URL}")
+        st.error(f"Error details: {str(e)}")
 
 # File uploader
 uploaded_file = st.file_uploader(
@@ -101,14 +102,24 @@ if uploaded_file is not None:
                 files = {"video": uploaded_file}
                 start_time = time.time()
                 
+                # Updated to use your actual endpoint
                 response = requests.post(
                     f"{FLASK_URL}/transcribe",
                     files=files,
-                    timeout=300
+                    timeout=300  # 5 minutes timeout for longer videos
                 )
                 
                 if response.status_code != 200:
-                    st.error(f"Error: {response.json().get('error', 'Unknown error')}")
+                    error_msg = response.json().get('error', 'Unknown error')
+                    st.error(f"Error: {error_msg}")
+                    
+                    # Special handling for FFmpeg errors
+                    if "ffmpeg" in error_msg.lower():
+                        st.warning("""
+                        **FFmpeg is required for audio extraction.**  
+                        This backend service should have FFmpeg installed.  
+                        If you're seeing this error, please contact support.
+                        """)
                 else:
                     result = response.json()
                     processing_time = time.time() - start_time
@@ -124,7 +135,7 @@ if uploaded_file is not None:
                     with st.expander("📝 Full Transcription", expanded=False):
                         st.write(result.get("transcription", ""))
                     
-                    # Download button
+                    # Download button - Updated to match your backend
                     st.markdown("---")
                     st.markdown("### Download Results")
                     
@@ -135,8 +146,10 @@ if uploaded_file is not None:
                             try:
                                 excel_response = requests.post(
                                     f"{FLASK_URL}/download_excel",
-                                    json=result,
-                                    headers={"Content-Type": "application/json"},
+                                    json={
+                                        "extracted_info": result.get("extracted_info", {}),
+                                        "transcription": result.get("transcription", "")
+                                    },
                                     timeout=60
                                 )
                                 
@@ -148,11 +161,16 @@ if uploaded_file is not None:
                                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                                     )
                                 else:
-                                    st.error("Failed to generate Excel file")
+                                    st.error(f"Failed to generate Excel file: {excel_response.text}")
                             except Exception as e:
                                 st.error(f"Error downloading Excel: {str(e)}")
             except requests.exceptions.Timeout:
-                st.error("Processing took too long. Please try a shorter video.")
+                st.error("""
+                Processing took too long. Please try:
+                - A shorter video (under 2 minutes)
+                - A video with clearer audio
+                - Checking backend status above
+                """)
             except Exception as e:
                 st.error(f"Error processing video: {str(e)}")
 
@@ -165,8 +183,9 @@ st.markdown("""
 3. View the extracted information and full transcription
 4. Download the results as an Excel file if needed
 
-### ⚠️ Note:
-- Video processing may take several minutes depending on length
-- For best results, use videos with clear audio
-- Maximum recommended video length: 5 minutes
+### ⚠️ Important Notes:
+- Backend is hosted on Render's free tier (may be slow to start)
+- First request after inactivity may take 30-60 seconds
+- Maximum recommended video length: 2 minutes for free tier
+- For better performance, use videos with clear English speech
 """)
